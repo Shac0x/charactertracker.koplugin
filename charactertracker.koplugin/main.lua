@@ -358,7 +358,8 @@ function CharacterTracker:getDataFilePath()
         self.data_file = self:getSeriesDir() .. "/" .. safe_name .. ".json"
     else
         local doc_path = self.ui.document.file
-        self.data_file = doc_path .. ".characters.json"
+        local sidecar_dir = self.ui.doc_settings:getSidecarDir(doc_path)
+        self.data_file = sidecar_dir .. "/characters.json"
     end
     return self.data_file
 end
@@ -384,6 +385,7 @@ end
 function CharacterTracker:saveData()
     local path = self:getDataFilePath()
     local ok, content = pcall(json.encode, self.characters)
+    logger.info("CharacterTracker: saving data to", path)
     if ok then
         local f = io.open(path, "w")
         if f then
