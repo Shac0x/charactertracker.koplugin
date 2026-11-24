@@ -79,8 +79,10 @@ Then restart KOReader.
 1. **Tools → Character Tracker → Underline names in text** (toggle).
 2. Tap any underlined name to open its detail view.
 
-> Indexing runs once when the setting changes or when you add/edit characters.
-> A dismissible progress dialog is shown.
+> Names are searched in the book once and the results are cached in the book's
+> sidecar folder (`characters_index.lua`), so reopening the book is instant and
+> adding a character or alias only searches that new name. A dismissible
+> progress dialog is shown while searching.
 
 ### Linking a book to a series
 
