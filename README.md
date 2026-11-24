@@ -28,10 +28,21 @@ Never forget who's who in a long novel — or across an entire series — again.
 - **Tap any underlined name** to open that character's detail view instantly.
 - Re-indexes automatically when characters or aliases are added/edited.
 
-### Highlight integration
-- Adds a **Character** button to the highlight popup.
-- Selecting text and tapping **Character** offers to register the selection
-  as a new character (or warns you if it's already known).
+### Highlight and dictionary integration
+- Adds a **Character** button to the highlight popup and to the dictionary
+  popup (so a single long-pressed word works too). In the dictionary popup it
+  can be moved or hidden with *Dictionary settings → Customize buttons*.
+- Selecting a name and tapping **Character**:
+  - opens that character if the name or one of its aliases is already known;
+  - otherwise offers **New character** or **Add as alias of…**, so a
+    nickname, diminutive or title (Vasenka, Vasya, Sassata…) can be linked to
+    a known character in two taps.
+- The whole selection is used as the name, cleaned up: surrounding
+  punctuation and a possessive or case suffix after an apostrophe are dropped
+  ("Wenjie’nin" → "Wenjie", "Holmes's" → "Holmes"; "O'Brien" is kept).
+- Name matching in the text is a substring search, so an alias can be a stem:
+  "Vasenk" also matches "Vasenka", "Vasenku" and inflected forms. Avoid very
+  short stems, which match inside other words.
 
 ### Series support (shared characters across books)
 - **Link a book to a series** to share one character database across multiple books.
@@ -60,9 +71,14 @@ Then restart KOReader.
 ### Adding a character
 
 **From the highlight popup (recommended):**
-1. Long-press and select a character's name in the text.
-2. Tap **Character** in the popup.
-3. Confirm name and add an optional first note.
+1. Long-press a name: the dictionary popup has a **Character** button
+   (it reads **Character: <name>** when the word is already known, and opens
+   that character). For a multi-word selection, hold and drag, then tap
+   **Character** in the highlight popup.
+2. Tap **Character**.
+3. Choose **New character** and confirm the name (with an optional first
+   note), or **Add as alias of…**, pick the character and confirm the alias
+   (you can shorten it to a stem first).
 
 **From the Tools menu:**
 1. **Tools → Character Tracker → Add character**
@@ -95,12 +111,83 @@ To unlink: open the same menu entry and choose **Unlink from series**.
 ## Data storage
 
 - **Per-book mode** (default): characters are stored as
-  `<book_path>.characters.json` next to the book file.
+  `characters.json` in the book's sidecar folder (`<book>.sdr/`), so they
+  follow KOReader's *Book metadata location* setting and move with the book.
+  A `<book_path>.characters.json` file from older versions is still read and
+  moved to the sidecar folder on the next save.
 - **Series mode**: characters are stored in
   `<koreader-data>/character_tracker/<series_name>.json`
   and shared by every book linked to that series.
 
 The format is plain JSON — easy to back up, version-control, or edit by hand.
+
+---
+
+## Export / import (sync with a notes vault)
+
+**Tools → Character Tracker → Export / import** works like KOReader's own
+annotation export (*Bookmarks → Export annotations on book closing*):
+
+- **Export / import folder**: where the export files go, for example a
+  folder synced to your PC or notes vault. Export is off until a folder is set.
+- **Export characters on book closing**: writes the export file on every
+  settings save (book close and KOReader's periodic autosave).
+- **Export characters now**: writes it immediately. Also available as the
+  gesture / profile action *Character Tracker: export characters*.
+- **Keep all characters on import** (on by default): characters missing from
+  an imported file stay on the device. Turn it off to let deletions made in the
+  file remove characters that were not changed after the file was written.
+
+The export file is `<folder>/<book file name>.characters.json`
+(`<series_name>.series.characters.json` in series mode), pretty-printed with
+sorted keys so it diffs well in git:
+
+```json
+{
+    "characters": [
+        {
+            "aliases": ["Wenjie"],
+            "created": "2026-11-24 09:19",
+            "name": "Ye Wenjie",
+            "notes": [],
+            "rating": 0,
+            "relationships": [],
+            "role": "main",
+            "updated": "2026-11-24 09:50:00"
+        }
+    ],
+    "datetime": "2026-11-24 09:47:12",
+    "device_id": "0123456789ABCDEF0123456789ABCDEF"
+}
+```
+
+**Import:** when the export file was written by another device (a different
+`device_id`), the characters are merged: for a character present on both
+sides the newer one wins (the later of its `updated` and `created` stamps),
+characters only in the file are added. The merged list is saved and the
+export file is rewritten as this device's copy. This happens when the book is
+opened, and also while it stays open: on wake-up and, at most every 30
+seconds, on page turns, the plugin checks whether the file changed (e.g. a
+sync client brought a new version).
+
+**No idle rewrites:** the export file is only rewritten when the characters
+changed, not on every save, so a synced folder (git, Syncthing…) does not see
+a new version each time the device goes to sleep. If the file holds changes
+from elsewhere that were not merged yet, they are merged before writing, never
+overwritten.
+
+**Editing the file by hand** (e.g. on your PC), the same way as KOReader's
+annotation export files:
+
+1. Change any character of `device_id`, so the device treats the file as
+   coming from elsewhere.
+2. On every character you change or add, set `"updated"` to the current time
+   (`YYYY-MM-DD HH:MM:SS`), newer than the device's copy.
+3. If the device changes the same character before your edit arrives, the
+   newer change wins; with a git-synced folder, both sides changing the file
+   at the same time is a merge conflict to resolve in git.
+
+The plugin sets `updated` by itself whenever a character changes on the device.
 
 ---
 

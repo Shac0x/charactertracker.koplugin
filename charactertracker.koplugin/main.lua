@@ -26,7 +26,10 @@ local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local util = require("util")
 local json = require("json")
+local rapidjson = require("rapidjson")
+local filemanagerutil = require("apps/filemanager/filemanagerutil")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
@@ -98,6 +101,30 @@ local function trim(s)
     return (s:gsub("^%s*(.-)%s*$", "%1"))
 end
 
+--- Turn a text selection into a name suggestion: collapse whitespace, drop
+-- surrounding ASCII punctuation and a trailing suffix after an apostrophe
+-- ("Wenjie’nin" -> "Wenjie", "Holmes's" -> "Holmes"). The suffix is only
+-- dropped when it starts with a lowercase letter, so "O'Brien" is kept.
+local function cleanSelectedName(text)
+    local s = trim((text or ""):gsub("%s+", " "))
+    s = s:gsub("^%p+", ""):gsub("%p+$", "")
+    for _i, apostrophe in ipairs({ "\226\128\153", "'" }) do -- ’ and '
+        local pos = s:find(apostrophe, 1, true)
+        local last
+        while pos do
+            last = pos
+            pos = s:find(apostrophe, pos + 1, true)
+        end
+        if last and last > 1 then
+            local suffix = s:sub(last + #apostrophe)
+            if suffix ~= "" and not suffix:find("%s") and not suffix:find("^%u") then
+                s = s:sub(1, last - 1)
+            end
+        end
+    end
+    return trim(s:gsub("%p+$", ""))
+end
+
 --- Get plain text from a note (supports legacy table format and current string format).
 local function getNoteText(note)
     if type(note) == "table" then return note.text or "" end
@@ -115,9 +142,39 @@ end
 -- ============================================================
 
 function CharacterTracker:init()
+    -- Keep the path: ui.document is already nil when SaveSettings runs on close.
+    self.doc_file = self.ui.document and self.ui.document.file
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
+    self:registerDictButton()
     self.characters = {}
+end
+
+--- "Character" button in the dictionary popup, so a single long-pressed
+-- word (which opens the dictionary, not the highlight menu) can be added or
+-- linked as an alias directly. Needs KOReader's dictionary button API.
+function CharacterTracker:registerDictButton()
+    if not (self.ui.dictionary and self.ui.dictionary.addToDictButtons) then return end
+    self.ui.dictionary:addToDictButtons({
+        id = "charactertracker",
+        menu_text = _("Character"),
+        -- Note: Button calls text_func without arguments (despite the API doc),
+        -- so the word is captured in show_func, which runs just before.
+        text_func = function()
+            local word = self.dict_popup_word
+            local char = word and self:getCharacterByName(cleanSelectedName(word))
+            return char and T(_("Character: %1"), char.name) or _("Character")
+        end,
+        show_func = function(dict_popup)
+            self.dict_popup_word = dict_popup and dict_popup.word
+            return dict_popup ~= nil and not dict_popup.is_wiki and not dict_popup:isDocless()
+        end,
+        callback = function(dict_popup)
+            local word = dict_popup.word
+            dict_popup:onClose()
+            self:onAssignHighlightToCharacter({ text = word })
+        end,
+    })
 end
 
 function CharacterTracker:onDispatcherRegisterActions()
@@ -127,10 +184,17 @@ function CharacterTracker:onDispatcherRegisterActions()
         title = _("Character Tracker: show characters"),
         reader = true,
     })
+    Dispatcher:registerAction("character_tracker_export", {
+        category = "none",
+        event = "ExportCharacters",
+        title = _("Character Tracker: export characters"),
+        reader = true,
+    })
 end
 
 function CharacterTracker:onReaderReady()
     self:loadData()
+    self.data_loaded = true
     -- Load underline preference (default: off)
     local saved = self.ui.doc_settings:readSetting("character_tracker_underline")
     if saved ~= nil then
@@ -180,6 +244,9 @@ end
 
 function CharacterTracker:onPageUpdate()
     self.visible_boxes = {}
+    if self.data_loaded then
+        self:checkExportFileChanged()
+    end
 end
 
 -- ============================================================
@@ -357,15 +424,31 @@ function CharacterTracker:getDataFilePath()
         local safe_name = series:gsub("[^%w%s%-_]", ""):gsub("%s+", "_")
         self.data_file = self:getSeriesDir() .. "/" .. safe_name .. ".json"
     else
-        local doc_path = self.ui.document.file
-        self.data_file = doc_path .. ".characters.json"
+        -- Store per-book data in the book's sidecar (.sdr) directory,
+        -- following the user's "document_metadata_folder" setting.
+        local doc_path = self.doc_file or self.ui.document.file
+        local sidecar_dir = self.ui.doc_settings:getSidecarDir(doc_path)
+        self.data_file = sidecar_dir .. "/characters.json"
     end
     return self.data_file
+end
+
+--- Path used by older versions: next to the book file.
+function CharacterTracker:getLegacyDataFilePath()
+    return (self.doc_file or self.ui.document.file) .. ".characters.json"
 end
 
 function CharacterTracker:loadData()
     self.characters = {}
     local path = self:getDataFilePath()
+    if lfs.attributes(path, "mode") ~= "file" and not self:getSeriesName() then
+        -- Fall back to the legacy location; the next save writes to the sidecar dir.
+        local legacy = self:getLegacyDataFilePath()
+        if lfs.attributes(legacy, "mode") == "file" then
+            logger.info("CharacterTracker: loading legacy data file", legacy)
+            path = legacy
+        end
+    end
     local f = io.open(path, "r")
     if f then
         local content = f:read("*all")
@@ -379,19 +462,285 @@ function CharacterTracker:loadData()
             end
         end
     end
+    -- Merge changes made elsewhere (another device, or the export file
+    -- edited by hand), then rewrite the export file as this device's copy.
+    local imported = self:importCharacters()
+    self:snapshotCharacters()
+    if imported then
+        self:saveData()
+        self:exportCharacters(false, false, true)
+    end
+    self:rememberExportMtime()
 end
 
 function CharacterTracker:saveData()
     local path = self:getDataFilePath()
+    self:stampChangedCharacters()
     local ok, content = pcall(json.encode, self.characters)
     if ok then
-        local f = io.open(path, "w")
+        -- The sidecar dir may not exist yet (book never saved its settings).
+        -- util.makePath also creates intermediate dirs ("dir" and "hash" modes).
+        local dir = path:match("^(.*)/[^/]+$")
+        if dir then
+            util.makePath(dir)
+        end
+        local f, err = io.open(path, "w")
         if f then
             f:write(content)
             f:close()
+            self:snapshotCharacters()
+        else
+            logger.warn("CharacterTracker: cannot write", path, err)
         end
     else
         logger.warn("CharacterTracker: failed to encode data")
+    end
+end
+
+-- ============================================================
+-- EXPORT / IMPORT
+-- Mirrors KOReader's own annotations export: on every settings save the
+-- characters are written to "<folder>/<book file>.characters.json". When
+-- that file was written by another device (or edited by hand with a
+-- different device_id), it is merged back when the book is opened.
+-- ============================================================
+
+local function nowString()
+    return os.date("%Y-%m-%d %H:%M:%S")
+end
+
+--- Timestamp used to decide which copy of a character is newer: the later
+-- of "updated" and "created", so a hand edit that only touched "created"
+-- still counts.
+local function charStamp(char)
+    local updated = type(char.updated) == "string" and char.updated or ""
+    local created = type(char.created) == "string" and char.created or ""
+    return updated > created and updated or created
+end
+
+--- Canonical text of a character list, to tell whether it changed.
+local function charactersSignature(list)
+    local ok, s = pcall(rapidjson.encode, list or {},
+        { sort_keys = true, empty_table_as_array = true })
+    return ok and s or ""
+end
+
+--- Content of a character without its "updated" stamp, for change detection.
+local function charSignature(char)
+    local copy = {}
+    for k, v in pairs(char) do
+        if k ~= "updated" then copy[k] = v end
+    end
+    local ok, s = pcall(rapidjson.encode, copy, { sort_keys = true })
+    return ok and s or ""
+end
+
+function CharacterTracker:getExportFolder()
+    return G_reader_settings:readSetting("character_tracker_export_folder")
+end
+
+function CharacterTracker:getExportFilePath()
+    local folder = self:getExportFolder()
+    if not folder or folder == "" then return nil end
+    local base
+    local series = self:getSeriesName()
+    if series and series ~= "" then
+        base = series:gsub("[^%w%s%-_]", ""):gsub("%s+", "_") .. ".series"
+    else
+        local doc_file = self.doc_file or (self.ui.document and self.ui.document.file)
+        if not doc_file then return nil end
+        base = doc_file:gsub(".*/", "")
+    end
+    return folder .. "/" .. base .. ".characters.json"
+end
+
+--- Remember each character's content so saveData can stamp changed ones.
+function CharacterTracker:snapshotCharacters()
+    self.char_signatures = {}
+    for _i, char in ipairs(self.characters or {}) do
+        self.char_signatures[char.name:lower()] = charSignature(char)
+    end
+end
+
+--- Set "updated" on characters that changed since the last snapshot.
+function CharacterTracker:stampChangedCharacters()
+    local signatures = self.char_signatures or {}
+    local now = nowString()
+    for _i, char in ipairs(self.characters or {}) do
+        if signatures[char.name:lower()] ~= charSignature(char) then
+            char.updated = now
+        end
+    end
+end
+
+--- Read and decode the export file; nil when missing or unreadable.
+function CharacterTracker:readExportFile()
+    local path = self:getExportFilePath()
+    if not path or lfs.attributes(path, "mode") ~= "file" then return nil end
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local content = f:read("*all")
+    f:close()
+    local ok, data = pcall(rapidjson.decode, content)
+    if not ok or type(data) ~= "table" or type(data.characters) ~= "table" then
+        logger.warn("CharacterTracker: cannot parse export file", path)
+        return nil
+    end
+    return data
+end
+
+function CharacterTracker:rememberExportMtime()
+    local path = self:getExportFilePath()
+    self.export_mtime = path and lfs.attributes(path, "modification") or nil
+end
+
+--- Write the export file. Unless forced, it is left untouched when it already
+-- holds this device's copy of the same characters, so idle saves (autosave,
+-- suspend) do not rewrite it and a synced folder sees no change. When the
+-- file holds changes from elsewhere that were not merged yet, they are merged
+-- first instead of being overwritten.
+function CharacterTracker:exportCharacters(show_notification, force, already_merged)
+    local path = self:getExportFilePath()
+    if not path then
+        if show_notification then
+            UIManager:show(InfoMessage:new{
+                text = _("Set an export / import folder first."),
+            })
+        end
+        return false
+    end
+    local existing = self:readExportFile()
+    local device_id = G_reader_settings:readSetting("device_id")
+    if existing and existing.device_id ~= device_id then
+        if not already_merged and self:importCharacters() then
+            self:snapshotCharacters() -- keep the imported stamps
+            self:saveData()
+            if self.ui.document then self:rebuildMarks() end
+        end
+    elseif existing and not force
+            and charactersSignature(existing.characters) == charactersSignature(self.characters) then
+        self:rememberExportMtime()
+        return true -- unchanged
+    end
+    local content = {
+        device_id = G_reader_settings:readSetting("device_id"),
+        datetime = nowString(),
+        characters = self.characters or {},
+    }
+    local ok, encoded = pcall(rapidjson.encode, content,
+        { pretty = true, sort_keys = true, empty_table_as_array = true })
+    if not ok then
+        logger.warn("CharacterTracker: failed to encode export", encoded)
+        return false
+    end
+    util.makePath(self:getExportFolder())
+    local f, err = io.open(path, "w")
+    if not f then
+        logger.warn("CharacterTracker: cannot write export", path, err)
+        return false
+    end
+    f:write(encoded, "\n")
+    f:close()
+    self:rememberExportMtime()
+    if show_notification then
+        local Notification = require("ui/widget/notification")
+        Notification:notify(_("Characters exported"))
+    end
+    return true
+end
+
+--- Merge characters from the export file if another device wrote it.
+-- Returns true when the local list changed.
+function CharacterTracker:importCharacters()
+    local data = self:readExportFile()
+    if not data then return false end
+    if data.device_id == G_reader_settings:readSetting("device_id") then
+        return false -- written by this device
+    end
+    logger.info("CharacterTracker: importing characters from", self:getExportFilePath())
+
+    local incoming = {}
+    for _i, char in ipairs(data.characters) do
+        if type(char) == "table" and type(char.name) == "string" and char.name ~= "" then
+            incoming[char.name:lower()] = char
+        end
+    end
+    local keep_all = G_reader_settings:nilOrTrue("character_tracker_export_keep_all_on_import")
+    local file_datetime = type(data.datetime) == "string" and data.datetime or ""
+
+    local merged = {}
+    for _i, char in ipairs(self.characters or {}) do
+        local key = char.name:lower()
+        local other = incoming[key]
+        if other then
+            -- Same character on both sides: the newer one wins.
+            table.insert(merged, charStamp(other) > charStamp(char) and other or char)
+            incoming[key] = nil
+        elseif keep_all or charStamp(char) > file_datetime then
+            -- Missing from the file: keep it, unless removal is allowed and
+            -- the file is newer than our last change to it.
+            table.insert(merged, char)
+        end
+    end
+    -- Characters that only exist in the file.
+    for _i, char in ipairs(data.characters) do
+        if type(char) == "table" and type(char.name) == "string" and incoming[char.name:lower()] then
+            table.insert(merged, char)
+        end
+    end
+    -- Normalise fields edited by hand.
+    for _i, char in ipairs(merged) do
+        char.aliases = type(char.aliases) == "table" and char.aliases or {}
+        char.notes = type(char.notes) == "table" and char.notes or {}
+        char.relationships = type(char.relationships) == "table" and char.relationships or {}
+        char.rating = tonumber(char.rating) or 0
+        char.role = type(char.role) == "string" and char.role or ""
+    end
+    self.characters = merged
+    return true
+end
+
+function CharacterTracker:onSaveSettings()
+    if G_reader_settings:isTrue("character_tracker_export_on_closing") then
+        self:exportCharacters(false)
+    end
+end
+
+function CharacterTracker:onExportCharacters()
+    self:saveData()
+    self:exportCharacters(true, true)
+    return true
+end
+
+--- Pick up an export file that changed while the book stays open (e.g. a
+-- sync client brought a version edited elsewhere). Cheap: one stat call,
+-- at most every EXPORT_CHECK_INTERVAL seconds.
+local EXPORT_CHECK_INTERVAL = 30
+
+function CharacterTracker:checkExportFileChanged(force)
+    if not self:getExportFolder() then return end
+    local now = os.time()
+    if not force and self.export_checked_at and now - self.export_checked_at < EXPORT_CHECK_INTERVAL then
+        return
+    end
+    self.export_checked_at = now
+    local path = self:getExportFilePath()
+    local mtime = path and lfs.attributes(path, "modification")
+    if not mtime or mtime == self.export_mtime then return end
+    self.export_mtime = mtime
+    if self:importCharacters() then
+        self:snapshotCharacters() -- keep the imported stamps
+        self:saveData()
+        self:exportCharacters(false, false, true)
+        self:rebuildMarks()
+        local Notification = require("ui/widget/notification")
+        Notification:notify(_("Characters updated from the export file"))
+    end
+end
+
+function CharacterTracker:onResume()
+    if self.data_loaded then
+        self:checkExportFileChanged(true)
     end
 end
 
@@ -817,10 +1166,11 @@ function CharacterTracker:isAliasOrNameTaken(text, exclude_character)
     return nil
 end
 
-function CharacterTracker:showAddAliasDialog(character)
+function CharacterTracker:showAddAliasDialog(character, initial_text)
     local dialog
     dialog = InputDialog:new{
         title = T(_("Add alias for '%1'"), character.name),
+        input = initial_text,
         input_hint = _("Alias (nickname, title, etc.)"),
         buttons = {
             {
@@ -1637,22 +1987,102 @@ function CharacterTracker:onAssignHighlightToCharacter(selected)
         return
     end
 
-    local selected_text = selected.text or ""
+    local name = cleanSelectedName(selected.text or "")
+    if name == "" then return end
 
-    -- Check if selected text matches an existing character name or alias
-    local trimmed = selected_text:match("^%s*(.-)%s*$")
-    local existing = self:getCharacterByName(trimmed)
+    -- A known name or alias: open that character.
+    local existing = self:getCharacterByName(name)
     if existing then
-        UIManager:show(InfoMessage:new{
-            text = T(_("'%1' is already a known character."), existing.name),
-            timeout = 2,
-        })
+        self:showCharacterDetail(existing)
         return
     end
 
-    -- Offer to create a new character using the selection as name
-    local first_word = trimmed:match("^(%S+)") or ""
-    self:showAddCharacterDialog(first_word)
+    -- Unknown name: new character, or another name of a known one
+    -- (nickname, diminutive, title...).
+    local dialog
+    dialog = ButtonDialog:new{
+        title = T(_("'%1' is not a known character."), name),
+        buttons = {
+            {
+                {
+                    text = _("New character"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:showAddCharacterDialog(name)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Add as alias of…"),
+                    enabled = self.characters and #self.characters > 0,
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:showCharacterPicker(T(_("'%1' is an alias of:"), name), function(character)
+                            -- Editable, so the alias can be shortened to a stem
+                            -- that also matches inflected forms.
+                            self:showAddAliasDialog(character, name)
+                        end)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+--- Full-screen list of characters; calls on_pick(character) on selection.
+function CharacterTracker:showCharacterPicker(title, on_pick)
+    local sorted = {}
+    for _i, char in ipairs(self.characters or {}) do
+        table.insert(sorted, char)
+    end
+    table.sort(sorted, function(a, b) return a.name:lower() < b.name:lower() end)
+
+    local menu_container
+    local item_table = {}
+    for _i, char in ipairs(sorted) do
+        local text = char.name
+        if char.aliases and #char.aliases > 0 then
+            text = text .. "\n    aka: " .. table.concat(char.aliases, ", ")
+        end
+        table.insert(item_table, {
+            text = text,
+            callback = function()
+                UIManager:close(menu_container)
+                on_pick(char)
+            end,
+        })
+    end
+    local menu = Menu:new{
+        title = title,
+        item_table = item_table,
+        is_borderless = true,
+        is_popout = false,
+        covers_fullscreen_widget = true,
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+        onMenuSelect = function(_self, item)
+            if item.callback then item.callback() end
+        end,
+        close_callback = function()
+            UIManager:close(menu_container)
+        end,
+    }
+    menu_container = CenterContainer:new{
+        dimen = Screen:getSize(),
+        menu,
+    }
+    menu.show_parent = menu_container
+    UIManager:show(menu_container)
 end
 
 -- ============================================================
@@ -1878,6 +2308,65 @@ function CharacterTracker:addToMainMenu(menu_items)
                     end
                 end,
             },
+            {
+                text = _("Export / import"),
+                sub_item_table = self:getExportMenuItems(),
+            },
+        },
+    }
+end
+
+function CharacterTracker:getExportMenuItems()
+    return {
+        {
+            text = _("Export characters now"),
+            enabled_func = function()
+                return self:getExportFolder() ~= nil
+            end,
+            callback = function()
+                self:onExportCharacters()
+            end,
+        },
+        {
+            text = _("Export characters on book closing"),
+            help_text = _("Also writes the export file on every automatic save, like KOReader's annotation export."),
+            enabled_func = function()
+                return self:getExportFolder() ~= nil
+            end,
+            checked_func = function()
+                return G_reader_settings:isTrue("character_tracker_export_on_closing")
+            end,
+            callback = function()
+                G_reader_settings:flipNilOrFalse("character_tracker_export_on_closing")
+            end,
+        },
+        {
+            text = _("Keep all characters on import"),
+            help_text = _("When enabled, characters missing from the imported file are kept on this device. When disabled, they are removed if the file is newer than their last change."),
+            checked_func = function()
+                return G_reader_settings:nilOrTrue("character_tracker_export_keep_all_on_import")
+            end,
+            callback = function()
+                G_reader_settings:flipNilOrTrue("character_tracker_export_keep_all_on_import")
+            end,
+        },
+        {
+            text_func = function()
+                return T(_("Export / import folder: %1"), self:getExportFolder() or _("not set"))
+            end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                filemanagerutil.showChooseDialog(_("Current characters export folder:"),
+                    function(path)
+                        if path then
+                            G_reader_settings:saveSetting("character_tracker_export_folder", path)
+                        else
+                            G_reader_settings:delSetting("character_tracker_export_folder")
+                        end
+                        touchmenu_instance:updateItems()
+                    end,
+                    self:getExportFolder(), nil, nil, true)
+            end,
         },
     }
 end
