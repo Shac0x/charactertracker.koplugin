@@ -161,11 +161,20 @@ sorted keys so it diffs well in git:
 }
 ```
 
-**Import:** when a book is opened and its export file was written by another
-device (a different `device_id`), the characters are merged: for a character
-present on both sides the one with the newer `updated` stamp wins, characters
-only in the file are added. The merged list is saved and the export file is
-rewritten as this device's copy.
+**Import:** when the export file was written by another device (a different
+`device_id`), the characters are merged: for a character present on both
+sides the newer one wins (the later of its `updated` and `created` stamps),
+characters only in the file are added. The merged list is saved and the
+export file is rewritten as this device's copy. This happens when the book is
+opened, and also while it stays open: on wake-up and, at most every 30
+seconds, on page turns, the plugin checks whether the file changed (e.g. a
+sync client brought a new version).
+
+**No idle rewrites:** the export file is only rewritten when the characters
+changed, not on every save, so a synced folder (git, Syncthing…) does not see
+a new version each time the device goes to sleep. If the file holds changes
+from elsewhere that were not merged yet, they are merged before writing, never
+overwritten.
 
 **Editing the file by hand** (e.g. on your PC), the same way as KOReader's
 annotation export files:
@@ -174,9 +183,9 @@ annotation export files:
    coming from elsewhere.
 2. On every character you change or add, set `"updated"` to the current time
    (`YYYY-MM-DD HH:MM:SS`), newer than the device's copy.
-3. Make the edit while the book is closed on the device, and let the file
-   reach the device before opening the book: the device rewrites the export
-   file on every save, which would overwrite an edit that has not arrived yet.
+3. If the device changes the same character before your edit arrives, the
+   newer change wins; with a git-synced folder, both sides changing the file
+   at the same time is a merge conflict to resolve in git.
 
 The plugin sets `updated` by itself whenever a character changes on the device.
 

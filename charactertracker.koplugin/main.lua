@@ -194,6 +194,7 @@ end
 
 function CharacterTracker:onReaderReady()
     self:loadData()
+    self.data_loaded = true
     -- Load underline preference (default: off)
     local saved = self.ui.doc_settings:readSetting("character_tracker_underline")
     if saved ~= nil then
@@ -243,6 +244,9 @@ end
 
 function CharacterTracker:onPageUpdate()
     self.visible_boxes = {}
+    if self.data_loaded then
+        self:checkExportFileChanged()
+    end
 end
 
 -- ============================================================
@@ -464,8 +468,9 @@ function CharacterTracker:loadData()
     self:snapshotCharacters()
     if imported then
         self:saveData()
-        self:exportCharacters(false)
+        self:exportCharacters(false, false, true)
     end
+    self:rememberExportMtime()
 end
 
 function CharacterTracker:saveData()
@@ -504,9 +509,20 @@ local function nowString()
     return os.date("%Y-%m-%d %H:%M:%S")
 end
 
---- Timestamp used to decide which copy of a character is newer.
+--- Timestamp used to decide which copy of a character is newer: the later
+-- of "updated" and "created", so a hand edit that only touched "created"
+-- still counts.
 local function charStamp(char)
-    return char.updated or char.created or ""
+    local updated = type(char.updated) == "string" and char.updated or ""
+    local created = type(char.created) == "string" and char.created or ""
+    return updated > created and updated or created
+end
+
+--- Canonical text of a character list, to tell whether it changed.
+local function charactersSignature(list)
+    local ok, s = pcall(rapidjson.encode, list or {},
+        { sort_keys = true, empty_table_as_array = true })
+    return ok and s or ""
 end
 
 --- Content of a character without its "updated" stamp, for change detection.
@@ -557,7 +573,33 @@ function CharacterTracker:stampChangedCharacters()
     end
 end
 
-function CharacterTracker:exportCharacters(show_notification)
+--- Read and decode the export file; nil when missing or unreadable.
+function CharacterTracker:readExportFile()
+    local path = self:getExportFilePath()
+    if not path or lfs.attributes(path, "mode") ~= "file" then return nil end
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local content = f:read("*all")
+    f:close()
+    local ok, data = pcall(rapidjson.decode, content)
+    if not ok or type(data) ~= "table" or type(data.characters) ~= "table" then
+        logger.warn("CharacterTracker: cannot parse export file", path)
+        return nil
+    end
+    return data
+end
+
+function CharacterTracker:rememberExportMtime()
+    local path = self:getExportFilePath()
+    self.export_mtime = path and lfs.attributes(path, "modification") or nil
+end
+
+--- Write the export file. Unless forced, it is left untouched when it already
+-- holds this device's copy of the same characters, so idle saves (autosave,
+-- suspend) do not rewrite it and a synced folder sees no change. When the
+-- file holds changes from elsewhere that were not merged yet, they are merged
+-- first instead of being overwritten.
+function CharacterTracker:exportCharacters(show_notification, force, already_merged)
     local path = self:getExportFilePath()
     if not path then
         if show_notification then
@@ -566,6 +608,19 @@ function CharacterTracker:exportCharacters(show_notification)
             })
         end
         return false
+    end
+    local existing = self:readExportFile()
+    local device_id = G_reader_settings:readSetting("device_id")
+    if existing and existing.device_id ~= device_id then
+        if not already_merged and self:importCharacters() then
+            self:snapshotCharacters() -- keep the imported stamps
+            self:saveData()
+            if self.ui.document then self:rebuildMarks() end
+        end
+    elseif existing and not force
+            and charactersSignature(existing.characters) == charactersSignature(self.characters) then
+        self:rememberExportMtime()
+        return true -- unchanged
     end
     local content = {
         device_id = G_reader_settings:readSetting("device_id"),
@@ -586,6 +641,7 @@ function CharacterTracker:exportCharacters(show_notification)
     end
     f:write(encoded, "\n")
     f:close()
+    self:rememberExportMtime()
     if show_notification then
         local Notification = require("ui/widget/notification")
         Notification:notify(_("Characters exported"))
@@ -596,21 +652,12 @@ end
 --- Merge characters from the export file if another device wrote it.
 -- Returns true when the local list changed.
 function CharacterTracker:importCharacters()
-    local path = self:getExportFilePath()
-    if not path or lfs.attributes(path, "mode") ~= "file" then return false end
-    local f = io.open(path, "r")
-    if not f then return false end
-    local content = f:read("*all")
-    f:close()
-    local ok, data = pcall(rapidjson.decode, content)
-    if not ok or type(data) ~= "table" or type(data.characters) ~= "table" then
-        logger.warn("CharacterTracker: cannot parse export file", path)
-        return false
-    end
+    local data = self:readExportFile()
+    if not data then return false end
     if data.device_id == G_reader_settings:readSetting("device_id") then
         return false -- written by this device
     end
-    logger.info("CharacterTracker: importing characters from", path)
+    logger.info("CharacterTracker: importing characters from", self:getExportFilePath())
 
     local incoming = {}
     for _i, char in ipairs(data.characters) do
@@ -661,8 +708,40 @@ end
 
 function CharacterTracker:onExportCharacters()
     self:saveData()
-    self:exportCharacters(true)
+    self:exportCharacters(true, true)
     return true
+end
+
+--- Pick up an export file that changed while the book stays open (e.g. a
+-- sync client brought a version edited elsewhere). Cheap: one stat call,
+-- at most every EXPORT_CHECK_INTERVAL seconds.
+local EXPORT_CHECK_INTERVAL = 30
+
+function CharacterTracker:checkExportFileChanged(force)
+    if not self:getExportFolder() then return end
+    local now = os.time()
+    if not force and self.export_checked_at and now - self.export_checked_at < EXPORT_CHECK_INTERVAL then
+        return
+    end
+    self.export_checked_at = now
+    local path = self:getExportFilePath()
+    local mtime = path and lfs.attributes(path, "modification")
+    if not mtime or mtime == self.export_mtime then return end
+    self.export_mtime = mtime
+    if self:importCharacters() then
+        self:snapshotCharacters() -- keep the imported stamps
+        self:saveData()
+        self:exportCharacters(false, false, true)
+        self:rebuildMarks()
+        local Notification = require("ui/widget/notification")
+        Notification:notify(_("Characters updated from the export file"))
+    end
+end
+
+function CharacterTracker:onResume()
+    if self.data_loaded then
+        self:checkExportFileChanged(true)
+    end
 end
 
 --- Load characters from a specific file path (helper for merging)
