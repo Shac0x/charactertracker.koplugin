@@ -30,8 +30,17 @@ Never forget who's who in a long novel — or across an entire series — again.
 
 ### Highlight integration
 - Adds a **Character** button to the highlight popup.
-- Selecting text and tapping **Character** offers to register the selection
-  as a new character (or warns you if it's already known).
+- Selecting a name and tapping **Character**:
+  - opens that character if the name or one of its aliases is already known;
+  - otherwise offers **New character** or **Add as alias of…**, so a
+    nickname, diminutive or title (Vasenka, Vasya, Sassata…) can be linked to
+    a known character in two taps.
+- The whole selection is used as the name, cleaned up: surrounding
+  punctuation and a possessive or case suffix after an apostrophe are dropped
+  ("Wenjie’nin" → "Wenjie", "Holmes's" → "Holmes"; "O'Brien" is kept).
+- Name matching in the text is a substring search, so an alias can be a stem:
+  "Vasenk" also matches "Vasenka", "Vasenku" and inflected forms. Avoid very
+  short stems, which match inside other words.
 
 ### Series support (shared characters across books)
 - **Link a book to a series** to share one character database across multiple books.
@@ -60,9 +69,12 @@ Then restart KOReader.
 ### Adding a character
 
 **From the highlight popup (recommended):**
-1. Long-press and select a character's name in the text.
+1. Hold and drag to select a character's name in the text (a plain
+   long-press on one word opens the dictionary instead).
 2. Tap **Character** in the popup.
-3. Confirm name and add an optional first note.
+3. Choose **New character** and confirm the name (with an optional first
+   note), or **Add as alias of…**, pick the character and confirm the alias
+   (you can shorten it to a stem first).
 
 **From the Tools menu:**
 1. **Tools → Character Tracker → Add character**

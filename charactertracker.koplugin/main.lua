@@ -101,6 +101,30 @@ local function trim(s)
     return (s:gsub("^%s*(.-)%s*$", "%1"))
 end
 
+--- Turn a text selection into a name suggestion: collapse whitespace, drop
+-- surrounding ASCII punctuation and a trailing suffix after an apostrophe
+-- ("Wenjie’nin" -> "Wenjie", "Holmes's" -> "Holmes"). The suffix is only
+-- dropped when it starts with a lowercase letter, so "O'Brien" is kept.
+local function cleanSelectedName(text)
+    local s = trim((text or ""):gsub("%s+", " "))
+    s = s:gsub("^%p+", ""):gsub("%p+$", "")
+    for _i, apostrophe in ipairs({ "\226\128\153", "'" }) do -- ’ and '
+        local pos = s:find(apostrophe, 1, true)
+        local last
+        while pos do
+            last = pos
+            pos = s:find(apostrophe, pos + 1, true)
+        end
+        if last and last > 1 then
+            local suffix = s:sub(last + #apostrophe)
+            if suffix ~= "" and not suffix:find("%s") and not suffix:find("^%u") then
+                s = s:sub(1, last - 1)
+            end
+        end
+    end
+    return trim(s:gsub("%p+$", ""))
+end
+
 --- Get plain text from a note (supports legacy table format and current string format).
 local function getNoteText(note)
     if type(note) == "table" then return note.text or "" end
@@ -1035,10 +1059,11 @@ function CharacterTracker:isAliasOrNameTaken(text, exclude_character)
     return nil
 end
 
-function CharacterTracker:showAddAliasDialog(character)
+function CharacterTracker:showAddAliasDialog(character, initial_text)
     local dialog
     dialog = InputDialog:new{
         title = T(_("Add alias for '%1'"), character.name),
+        input = initial_text,
         input_hint = _("Alias (nickname, title, etc.)"),
         buttons = {
             {
@@ -1855,22 +1880,102 @@ function CharacterTracker:onAssignHighlightToCharacter(selected)
         return
     end
 
-    local selected_text = selected.text or ""
+    local name = cleanSelectedName(selected.text or "")
+    if name == "" then return end
 
-    -- Check if selected text matches an existing character name or alias
-    local trimmed = selected_text:match("^%s*(.-)%s*$")
-    local existing = self:getCharacterByName(trimmed)
+    -- A known name or alias: open that character.
+    local existing = self:getCharacterByName(name)
     if existing then
-        UIManager:show(InfoMessage:new{
-            text = T(_("'%1' is already a known character."), existing.name),
-            timeout = 2,
-        })
+        self:showCharacterDetail(existing)
         return
     end
 
-    -- Offer to create a new character using the selection as name
-    local first_word = trimmed:match("^(%S+)") or ""
-    self:showAddCharacterDialog(first_word)
+    -- Unknown name: new character, or another name of a known one
+    -- (nickname, diminutive, title...).
+    local dialog
+    dialog = ButtonDialog:new{
+        title = T(_("'%1' is not a known character."), name),
+        buttons = {
+            {
+                {
+                    text = _("New character"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:showAddCharacterDialog(name)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Add as alias of…"),
+                    enabled = self.characters and #self.characters > 0,
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:showCharacterPicker(T(_("'%1' is an alias of:"), name), function(character)
+                            -- Editable, so the alias can be shortened to a stem
+                            -- that also matches inflected forms.
+                            self:showAddAliasDialog(character, name)
+                        end)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+--- Full-screen list of characters; calls on_pick(character) on selection.
+function CharacterTracker:showCharacterPicker(title, on_pick)
+    local sorted = {}
+    for _i, char in ipairs(self.characters or {}) do
+        table.insert(sorted, char)
+    end
+    table.sort(sorted, function(a, b) return a.name:lower() < b.name:lower() end)
+
+    local menu_container
+    local item_table = {}
+    for _i, char in ipairs(sorted) do
+        local text = char.name
+        if char.aliases and #char.aliases > 0 then
+            text = text .. "\n    aka: " .. table.concat(char.aliases, ", ")
+        end
+        table.insert(item_table, {
+            text = text,
+            callback = function()
+                UIManager:close(menu_container)
+                on_pick(char)
+            end,
+        })
+    end
+    local menu = Menu:new{
+        title = title,
+        item_table = item_table,
+        is_borderless = true,
+        is_popout = false,
+        covers_fullscreen_widget = true,
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+        onMenuSelect = function(_self, item)
+            if item.callback then item.callback() end
+        end,
+        close_callback = function()
+            UIManager:close(menu_container)
+        end,
+    }
+    menu_container = CenterContainer:new{
+        dimen = Screen:getSize(),
+        menu,
+    }
+    menu.show_parent = menu_container
+    UIManager:show(menu_container)
 end
 
 -- ============================================================
