@@ -25,6 +25,10 @@ Never forget who's who in a long novel — or across an entire series — again.
 ### In-text recognition
 - **Underline character names** in the page (toggle in the menu).
   Names and aliases are indexed in the background using KOReader's `findAllText`.
+- **Match whole words only** (on by default): "Tom" matches "Tom", "Tom," and
+  "Tom's", not "Tomorrow" or "Atom". A suffix after an apostrophe still
+  matches (Turkish "Berk’in", English "Tom's"). Turn it off to also match
+  inside words, e.g. to use a word stem as an alias.
 - **Tap any underlined name** to open that character's detail view instantly.
 - Re-indexes automatically when characters or aliases are added/edited.
 
