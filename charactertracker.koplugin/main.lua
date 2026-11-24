@@ -26,6 +26,7 @@ local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local util = require("util")
 local json = require("json")
 local _ = require("gettext")
 local T = require("ffi/util").template
@@ -357,15 +358,31 @@ function CharacterTracker:getDataFilePath()
         local safe_name = series:gsub("[^%w%s%-_]", ""):gsub("%s+", "_")
         self.data_file = self:getSeriesDir() .. "/" .. safe_name .. ".json"
     else
+        -- Store per-book data in the book's sidecar (.sdr) directory,
+        -- following the user's "document_metadata_folder" setting.
         local doc_path = self.ui.document.file
-        self.data_file = doc_path .. ".characters.json"
+        local sidecar_dir = self.ui.doc_settings:getSidecarDir(doc_path)
+        self.data_file = sidecar_dir .. "/characters.json"
     end
     return self.data_file
+end
+
+--- Path used by older versions: next to the book file.
+function CharacterTracker:getLegacyDataFilePath()
+    return self.ui.document.file .. ".characters.json"
 end
 
 function CharacterTracker:loadData()
     self.characters = {}
     local path = self:getDataFilePath()
+    if lfs.attributes(path, "mode") ~= "file" and not self:getSeriesName() then
+        -- Fall back to the legacy location; the next save writes to the sidecar dir.
+        local legacy = self:getLegacyDataFilePath()
+        if lfs.attributes(legacy, "mode") == "file" then
+            logger.info("CharacterTracker: loading legacy data file", legacy)
+            path = legacy
+        end
+    end
     local f = io.open(path, "r")
     if f then
         local content = f:read("*all")
@@ -385,10 +402,18 @@ function CharacterTracker:saveData()
     local path = self:getDataFilePath()
     local ok, content = pcall(json.encode, self.characters)
     if ok then
-        local f = io.open(path, "w")
+        -- The sidecar dir may not exist yet (book never saved its settings).
+        -- util.makePath also creates intermediate dirs ("dir" and "hash" modes).
+        local dir = path:match("^(.*)/[^/]+$")
+        if dir then
+            util.makePath(dir)
+        end
+        local f, err = io.open(path, "w")
         if f then
             f:write(content)
             f:close()
+        else
+            logger.warn("CharacterTracker: cannot write", path, err)
         end
     else
         logger.warn("CharacterTracker: failed to encode data")
