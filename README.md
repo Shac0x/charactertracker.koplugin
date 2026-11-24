@@ -95,12 +95,74 @@ To unlink: open the same menu entry and choose **Unlink from series**.
 ## Data storage
 
 - **Per-book mode** (default): characters are stored as
-  `<book_path>.characters.json` next to the book file.
+  `characters.json` in the book's sidecar folder (`<book>.sdr/`), so they
+  follow KOReader's *Book metadata location* setting and move with the book.
+  A `<book_path>.characters.json` file from older versions is still read and
+  moved to the sidecar folder on the next save.
 - **Series mode**: characters are stored in
   `<koreader-data>/character_tracker/<series_name>.json`
   and shared by every book linked to that series.
 
 The format is plain JSON — easy to back up, version-control, or edit by hand.
+
+---
+
+## Export / import (sync with a notes vault)
+
+**Tools → Character Tracker → Export / import** works like KOReader's own
+annotation export (*Bookmarks → Export annotations on book closing*):
+
+- **Export / import folder**: where the export files go, for example a
+  folder synced to your PC or notes vault. Export is off until a folder is set.
+- **Export characters on book closing**: writes the export file on every
+  settings save (book close and KOReader's periodic autosave).
+- **Export characters now**: writes it immediately. Also available as the
+  gesture / profile action *Character Tracker: export characters*.
+- **Keep all characters on import** (on by default): characters missing from
+  an imported file stay on the device. Turn it off to let deletions made in the
+  file remove characters that were not changed after the file was written.
+
+The export file is `<folder>/<book file name>.characters.json`
+(`<series_name>.series.characters.json` in series mode), pretty-printed with
+sorted keys so it diffs well in git:
+
+```json
+{
+    "characters": [
+        {
+            "aliases": ["Wenjie"],
+            "created": "2026-11-24 09:19",
+            "name": "Ye Wenjie",
+            "notes": [],
+            "rating": 0,
+            "relationships": [],
+            "role": "main",
+            "updated": "2026-11-24 09:50:00"
+        }
+    ],
+    "datetime": "2026-11-24 09:47:12",
+    "device_id": "0123456789ABCDEF0123456789ABCDEF"
+}
+```
+
+**Import:** when a book is opened and its export file was written by another
+device (a different `device_id`), the characters are merged: for a character
+present on both sides the one with the newer `updated` stamp wins, characters
+only in the file are added. The merged list is saved and the export file is
+rewritten as this device's copy.
+
+**Editing the file by hand** (e.g. on your PC), the same way as KOReader's
+annotation export files:
+
+1. Change any character of `device_id`, so the device treats the file as
+   coming from elsewhere.
+2. On every character you change or add, set `"updated"` to the current time
+   (`YYYY-MM-DD HH:MM:SS`), newer than the device's copy.
+3. Make the edit while the book is closed on the device, and let the file
+   reach the device before opening the book: the device rewrites the export
+   file on every save, which would overwrite an edit that has not arrived yet.
+
+The plugin sets `updated` by itself whenever a character changes on the device.
 
 ---
 

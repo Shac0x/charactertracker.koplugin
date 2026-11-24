@@ -28,6 +28,8 @@ local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local util = require("util")
 local json = require("json")
+local rapidjson = require("rapidjson")
+local filemanagerutil = require("apps/filemanager/filemanagerutil")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
@@ -116,6 +118,8 @@ end
 -- ============================================================
 
 function CharacterTracker:init()
+    -- Keep the path: ui.document is already nil when SaveSettings runs on close.
+    self.doc_file = self.ui.document and self.ui.document.file
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
     self.characters = {}
@@ -126,6 +130,12 @@ function CharacterTracker:onDispatcherRegisterActions()
         category = "none",
         event = "ShowCharacterList",
         title = _("Character Tracker: show characters"),
+        reader = true,
+    })
+    Dispatcher:registerAction("character_tracker_export", {
+        category = "none",
+        event = "ExportCharacters",
+        title = _("Character Tracker: export characters"),
         reader = true,
     })
 end
@@ -360,7 +370,7 @@ function CharacterTracker:getDataFilePath()
     else
         -- Store per-book data in the book's sidecar (.sdr) directory,
         -- following the user's "document_metadata_folder" setting.
-        local doc_path = self.ui.document.file
+        local doc_path = self.doc_file or self.ui.document.file
         local sidecar_dir = self.ui.doc_settings:getSidecarDir(doc_path)
         self.data_file = sidecar_dir .. "/characters.json"
     end
@@ -369,7 +379,7 @@ end
 
 --- Path used by older versions: next to the book file.
 function CharacterTracker:getLegacyDataFilePath()
-    return self.ui.document.file .. ".characters.json"
+    return (self.doc_file or self.ui.document.file) .. ".characters.json"
 end
 
 function CharacterTracker:loadData()
@@ -396,10 +406,19 @@ function CharacterTracker:loadData()
             end
         end
     end
+    -- Merge changes made elsewhere (another device, or the export file
+    -- edited by hand), then rewrite the export file as this device's copy.
+    local imported = self:importCharacters()
+    self:snapshotCharacters()
+    if imported then
+        self:saveData()
+        self:exportCharacters(false)
+    end
 end
 
 function CharacterTracker:saveData()
     local path = self:getDataFilePath()
+    self:stampChangedCharacters()
     local ok, content = pcall(json.encode, self.characters)
     if ok then
         -- The sidecar dir may not exist yet (book never saved its settings).
@@ -412,12 +431,186 @@ function CharacterTracker:saveData()
         if f then
             f:write(content)
             f:close()
+            self:snapshotCharacters()
         else
             logger.warn("CharacterTracker: cannot write", path, err)
         end
     else
         logger.warn("CharacterTracker: failed to encode data")
     end
+end
+
+-- ============================================================
+-- EXPORT / IMPORT
+-- Mirrors KOReader's own annotations export: on every settings save the
+-- characters are written to "<folder>/<book file>.characters.json". When
+-- that file was written by another device (or edited by hand with a
+-- different device_id), it is merged back when the book is opened.
+-- ============================================================
+
+local function nowString()
+    return os.date("%Y-%m-%d %H:%M:%S")
+end
+
+--- Timestamp used to decide which copy of a character is newer.
+local function charStamp(char)
+    return char.updated or char.created or ""
+end
+
+--- Content of a character without its "updated" stamp, for change detection.
+local function charSignature(char)
+    local copy = {}
+    for k, v in pairs(char) do
+        if k ~= "updated" then copy[k] = v end
+    end
+    local ok, s = pcall(rapidjson.encode, copy, { sort_keys = true })
+    return ok and s or ""
+end
+
+function CharacterTracker:getExportFolder()
+    return G_reader_settings:readSetting("character_tracker_export_folder")
+end
+
+function CharacterTracker:getExportFilePath()
+    local folder = self:getExportFolder()
+    if not folder or folder == "" then return nil end
+    local base
+    local series = self:getSeriesName()
+    if series and series ~= "" then
+        base = series:gsub("[^%w%s%-_]", ""):gsub("%s+", "_") .. ".series"
+    else
+        local doc_file = self.doc_file or (self.ui.document and self.ui.document.file)
+        if not doc_file then return nil end
+        base = doc_file:gsub(".*/", "")
+    end
+    return folder .. "/" .. base .. ".characters.json"
+end
+
+--- Remember each character's content so saveData can stamp changed ones.
+function CharacterTracker:snapshotCharacters()
+    self.char_signatures = {}
+    for _i, char in ipairs(self.characters or {}) do
+        self.char_signatures[char.name:lower()] = charSignature(char)
+    end
+end
+
+--- Set "updated" on characters that changed since the last snapshot.
+function CharacterTracker:stampChangedCharacters()
+    local signatures = self.char_signatures or {}
+    local now = nowString()
+    for _i, char in ipairs(self.characters or {}) do
+        if signatures[char.name:lower()] ~= charSignature(char) then
+            char.updated = now
+        end
+    end
+end
+
+function CharacterTracker:exportCharacters(show_notification)
+    local path = self:getExportFilePath()
+    if not path then
+        if show_notification then
+            UIManager:show(InfoMessage:new{
+                text = _("Set an export / import folder first."),
+            })
+        end
+        return false
+    end
+    local content = {
+        device_id = G_reader_settings:readSetting("device_id"),
+        datetime = nowString(),
+        characters = self.characters or {},
+    }
+    local ok, encoded = pcall(rapidjson.encode, content,
+        { pretty = true, sort_keys = true, empty_table_as_array = true })
+    if not ok then
+        logger.warn("CharacterTracker: failed to encode export", encoded)
+        return false
+    end
+    util.makePath(self:getExportFolder())
+    local f, err = io.open(path, "w")
+    if not f then
+        logger.warn("CharacterTracker: cannot write export", path, err)
+        return false
+    end
+    f:write(encoded, "\n")
+    f:close()
+    if show_notification then
+        local Notification = require("ui/widget/notification")
+        Notification:notify(_("Characters exported"))
+    end
+    return true
+end
+
+--- Merge characters from the export file if another device wrote it.
+-- Returns true when the local list changed.
+function CharacterTracker:importCharacters()
+    local path = self:getExportFilePath()
+    if not path or lfs.attributes(path, "mode") ~= "file" then return false end
+    local f = io.open(path, "r")
+    if not f then return false end
+    local content = f:read("*all")
+    f:close()
+    local ok, data = pcall(rapidjson.decode, content)
+    if not ok or type(data) ~= "table" or type(data.characters) ~= "table" then
+        logger.warn("CharacterTracker: cannot parse export file", path)
+        return false
+    end
+    if data.device_id == G_reader_settings:readSetting("device_id") then
+        return false -- written by this device
+    end
+    logger.info("CharacterTracker: importing characters from", path)
+
+    local incoming = {}
+    for _i, char in ipairs(data.characters) do
+        if type(char) == "table" and type(char.name) == "string" and char.name ~= "" then
+            incoming[char.name:lower()] = char
+        end
+    end
+    local keep_all = G_reader_settings:nilOrTrue("character_tracker_export_keep_all_on_import")
+    local file_datetime = type(data.datetime) == "string" and data.datetime or ""
+
+    local merged = {}
+    for _i, char in ipairs(self.characters or {}) do
+        local key = char.name:lower()
+        local other = incoming[key]
+        if other then
+            -- Same character on both sides: the newer one wins.
+            table.insert(merged, charStamp(other) > charStamp(char) and other or char)
+            incoming[key] = nil
+        elseif keep_all or charStamp(char) > file_datetime then
+            -- Missing from the file: keep it, unless removal is allowed and
+            -- the file is newer than our last change to it.
+            table.insert(merged, char)
+        end
+    end
+    -- Characters that only exist in the file.
+    for _i, char in ipairs(data.characters) do
+        if type(char) == "table" and type(char.name) == "string" and incoming[char.name:lower()] then
+            table.insert(merged, char)
+        end
+    end
+    -- Normalise fields edited by hand.
+    for _i, char in ipairs(merged) do
+        char.aliases = type(char.aliases) == "table" and char.aliases or {}
+        char.notes = type(char.notes) == "table" and char.notes or {}
+        char.relationships = type(char.relationships) == "table" and char.relationships or {}
+        char.rating = tonumber(char.rating) or 0
+        char.role = type(char.role) == "string" and char.role or ""
+    end
+    self.characters = merged
+    return true
+end
+
+function CharacterTracker:onSaveSettings()
+    if G_reader_settings:isTrue("character_tracker_export_on_closing") then
+        self:exportCharacters(false)
+    end
+end
+
+function CharacterTracker:onExportCharacters()
+    self:saveData()
+    self:exportCharacters(true)
+    return true
 end
 
 --- Load characters from a specific file path (helper for merging)
@@ -1903,6 +2096,65 @@ function CharacterTracker:addToMainMenu(menu_items)
                     end
                 end,
             },
+            {
+                text = _("Export / import"),
+                sub_item_table = self:getExportMenuItems(),
+            },
+        },
+    }
+end
+
+function CharacterTracker:getExportMenuItems()
+    return {
+        {
+            text = _("Export characters now"),
+            enabled_func = function()
+                return self:getExportFolder() ~= nil
+            end,
+            callback = function()
+                self:onExportCharacters()
+            end,
+        },
+        {
+            text = _("Export characters on book closing"),
+            help_text = _("Also writes the export file on every automatic save, like KOReader's annotation export."),
+            enabled_func = function()
+                return self:getExportFolder() ~= nil
+            end,
+            checked_func = function()
+                return G_reader_settings:isTrue("character_tracker_export_on_closing")
+            end,
+            callback = function()
+                G_reader_settings:flipNilOrFalse("character_tracker_export_on_closing")
+            end,
+        },
+        {
+            text = _("Keep all characters on import"),
+            help_text = _("When enabled, characters missing from the imported file are kept on this device. When disabled, they are removed if the file is newer than their last change."),
+            checked_func = function()
+                return G_reader_settings:nilOrTrue("character_tracker_export_keep_all_on_import")
+            end,
+            callback = function()
+                G_reader_settings:flipNilOrTrue("character_tracker_export_keep_all_on_import")
+            end,
+        },
+        {
+            text_func = function()
+                return T(_("Export / import folder: %1"), self:getExportFolder() or _("not set"))
+            end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                filemanagerutil.showChooseDialog(_("Current characters export folder:"),
+                    function(path)
+                        if path then
+                            G_reader_settings:saveSetting("character_tracker_export_folder", path)
+                        else
+                            G_reader_settings:delSetting("character_tracker_export_folder")
+                        end
+                        touchmenu_instance:updateItems()
+                    end,
+                    self:getExportFolder(), nil, nil, true)
+            end,
         },
     }
 end
