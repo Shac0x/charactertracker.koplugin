@@ -146,7 +146,35 @@ function CharacterTracker:init()
     self.doc_file = self.ui.document and self.ui.document.file
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
+    self:registerDictButton()
     self.characters = {}
+end
+
+--- "Character" button in the dictionary popup, so a single long-pressed
+-- word (which opens the dictionary, not the highlight menu) can be added or
+-- linked as an alias directly. Needs KOReader's dictionary button API.
+function CharacterTracker:registerDictButton()
+    if not (self.ui.dictionary and self.ui.dictionary.addToDictButtons) then return end
+    self.ui.dictionary:addToDictButtons({
+        id = "charactertracker",
+        menu_text = _("Character"),
+        -- Note: Button calls text_func without arguments (despite the API doc),
+        -- so the word is captured in show_func, which runs just before.
+        text_func = function()
+            local word = self.dict_popup_word
+            local char = word and self:getCharacterByName(cleanSelectedName(word))
+            return char and T(_("Character: %1"), char.name) or _("Character")
+        end,
+        show_func = function(dict_popup)
+            self.dict_popup_word = dict_popup and dict_popup.word
+            return dict_popup ~= nil and not dict_popup.is_wiki and not dict_popup:isDocless()
+        end,
+        callback = function(dict_popup)
+            local word = dict_popup.word
+            dict_popup:onClose()
+            self:onAssignHighlightToCharacter({ text = word })
+        end,
+    })
 end
 
 function CharacterTracker:onDispatcherRegisterActions()

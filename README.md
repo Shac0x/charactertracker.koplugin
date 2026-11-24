@@ -28,8 +28,10 @@ Never forget who's who in a long novel — or across an entire series — again.
 - **Tap any underlined name** to open that character's detail view instantly.
 - Re-indexes automatically when characters or aliases are added/edited.
 
-### Highlight integration
-- Adds a **Character** button to the highlight popup.
+### Highlight and dictionary integration
+- Adds a **Character** button to the highlight popup and to the dictionary
+  popup (so a single long-pressed word works too). In the dictionary popup it
+  can be moved or hidden with *Dictionary settings → Customize buttons*.
 - Selecting a name and tapping **Character**:
   - opens that character if the name or one of its aliases is already known;
   - otherwise offers **New character** or **Add as alias of…**, so a
@@ -69,9 +71,11 @@ Then restart KOReader.
 ### Adding a character
 
 **From the highlight popup (recommended):**
-1. Hold and drag to select a character's name in the text (a plain
-   long-press on one word opens the dictionary instead).
-2. Tap **Character** in the popup.
+1. Long-press a name: the dictionary popup has a **Character** button
+   (it reads **Character: <name>** when the word is already known, and opens
+   that character). For a multi-word selection, hold and drag, then tap
+   **Character** in the highlight popup.
+2. Tap **Character**.
 3. Choose **New character** and confirm the name (with an optional first
    note), or **Add as alias of…**, pick the character and confirm the alias
    (you can shorten it to a stem first).
